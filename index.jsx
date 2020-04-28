@@ -12,32 +12,61 @@ var ndSlice = (ndarr, from, to) => {
 
 function LinesState (regl) {
   this.regl = regl
-  var arrayLength = 1000 // length in number of points
+  var arrayLength = 10000 // length in number of points
   var points = ndarray(new Uint16Array(arrayLength*2), [arrayLength, 2])
   var widths = ndarray(new Uint16Array(arrayLength), [arrayLength])
   var normals = ndarray(new Int16Array(arrayLength*2), [arrayLength, 2])
-  var lineIds = ndarray(new Uint16Array(arrayLength))
-  var currentLineId = 0 // blank line
+  var lineBreaks = {}
   var currentIdx = 0
 
   this.startNewLine = () => {
-    currentLineId = 1
-    currentIdx = 0
+    lineBreaks[currentIdx] = true
+    // currentIdx = 0
   }
-  this.addPoint = ([x, y, width]) => {
+  this.addPoint = ([x,y,width,normal]) => {
+    var pointAtIndex = idx => ([points.get(...[idx-1], 0), points.get(...[idx-1], 1)])
+    var l2Distance = (p1, p2) => Math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+    var quadraticCurve = (p1, p2, p3) => {
+      console.log(p1, p2, p3)
+      var [x1, y1] = p1
+      var [x2, y2] = p2
+      var [x3, y3] = p3
+      var denom = (x1-x2) * (x1-x3) * (x2-x3)
+      var A = (x3 * (y2-y1) + x2 * (y1-y3) + x1 * (y3-y2)) / denom
+      var B = (x3**2 * (y1-y2) + x2**2 * (y3-y1) + x1**2 * (y2-y3)) / denom
+      var C = (x2 * x3 * (x2-x3) * y1 + x3 * x1 * (x3-x1) * y2 + x1 * x2 * (x1-x2) * y3) / denom
+      return [A, B, C]
+    }
+
+    if (l2Distance([x,y], pointAtIndex(currentIdx)) > 10) {
+      var lastPoint = pointAtIndex(currentIdx)
+      // var [A, B, C] = quadraticCurve(pointAtIndex(currentIdx-1), lastPoint, [x,y])
+      // var newPointX = lastPoint[0] + (x - lastPoint[0])/2
+      // var newPointY = A * newPointX**2 + B * newPointX + C
+      // console.log(A, B, C)
+      // console.log(newPointX)
+      // console.log(newPointY)
+      // this.addPointToSet([newPointX,newPointY,width,normal])
+      this.addPointToSet([x,y,width,normal])
+    } else {
+      this.addPointToSet([x,y,width,normal])
+    }
+
+  }
+
+  this.addPointToSet = ([x, y, width, normal]) => {
     var [lastX, lastY] = [points.get(...[currentIdx-1], 0), points.get(...[currentIdx-1], 1)]
-    var normal = [-(y - lastY), x - lastX]
+    normal = normal || [-(y - lastY), x - lastX]
     normals.set(...[currentIdx, 0], normal[0])
     normals.set(...[currentIdx, 1], normal[1])
     points.set(...[currentIdx, 0], x)
     points.set(...[currentIdx, 1], y)
     widths.set(...[currentIdx], width)
-    lineIds.set(...[currentIdx], currentLineId)
     currentIdx += 1
   }
 
   var buffers = {}
-  var bufferSet1 = {"point": points, "width": widths, "normal": normals, "lineId": lineIds}
+  var bufferSet1 = {"point": points, "width": widths, "normal": normals}
   var bufferSet2 = {"normalMultiplier": null}
   Object.keys({...bufferSet1, ...bufferSet2}).forEach(name => {
     buffers[name] = this.regl.buffer()
@@ -56,6 +85,7 @@ function LinesState (regl) {
     if (numPoints < 2) {return ({elements})}
     var elements = new Uint16Array((numPoints - 1) * 2 * 3)
     for (var idx =0; idx<numPoints-1; idx++) {
+      if (idx+1 in lineBreaks) {continue}
       var tri1 = [idx, idx+arrayLength + 1, idx+1]
       elements.set(tri1, 6*idx)
       var tri2 = [idx+arrayLength, idx+arrayLength+1, idx]
@@ -138,11 +168,21 @@ var App = props => {
       }
       var [x, y] = screenSpaceToCanvasSpace(e)
 
+      var canvasSize = canvas.getBoundingClientRect();
+      if (x >= canvasSize.width || x < 0 || y >= canvasSize.height || y < 0) {pencilOnPaper = false}
+
       if (pencilOnPaper) {
         // const minDist = 1
         // var lastPoint = currentLine[currentLine.length - 1] || [-minDist, -minDist]
         // if (Math.abs(lastPoint[0] - x) > minDist || Math.abs(lastPoint[1]-y) > minDist) {
-          linesState.addPoint([x, y, 3])
+        var width = 1
+        var normal
+        if (e.touches && e.touches[0]) {
+          var touch = e.touches[0]
+          // width = Math.cos(touch.altitudeAngle) * 10 + 2
+          normal = [10*Math.cos(touch.azimuthAngle), 10*Math.sin(touch.azimuthAngle)]
+        }
+        linesState.addPoint([x, y, width, normal])
         // }
       }
     }
@@ -173,7 +213,6 @@ var App = props => {
         attribute float normalMultiplier;
         uniform mat4 projection;
         void main() {
-          // vec2 normal = vec2(0.7, 0.7);
           vec2 normedNormal = normalize(normal);
 
           vec2 pointPosition = width * normedNormal * normalMultiplier + point;
@@ -190,12 +229,7 @@ var App = props => {
 
       uniforms: {
         projection: canvasSpaceToGlSpace,
-        color: () => ([
-          Math.cos(Date.now() * 0.001),
-          Math.sin(Date.now() * 0.0008),
-          Math.cos(Date.now() * 0.003),
-          1
-        ])
+        color: () => ([0,0,0,1])
       },
 
       attributes: {
