@@ -4,6 +4,7 @@ import Regl from "regl"
 import mat4 from "gl-mat4"
 import ndarray from "ndarray"
 import ndops from "ndarray-ops"
+import Bezier from "bezier-js"
 
 var ndSlice = (ndarr, from, to) => {
   var lengths = to.map((t, idx) => from[idx] - t)
@@ -16,57 +17,69 @@ function LinesState (regl) {
   var points = ndarray(new Uint16Array(arrayLength*2), [arrayLength, 2])
   var widths = ndarray(new Uint16Array(arrayLength), [arrayLength])
   var normals = ndarray(new Int16Array(arrayLength*2), [arrayLength, 2])
+  var colors = ndarray(new Uint8Array(arrayLength*4), [arrayLength, 4])
   var lineBreaks = {}
+  var lastLineBreak = 0
   var currentIdx = 0
+  var currentLineNoninterpBuffer = [] // non-interpolated points (i.e. actual input) for current line
 
   this.startNewLine = () => {
     lineBreaks[currentIdx] = true
-    // currentIdx = 0
+    lastLineBreak = currentIdx
+    currentLineNoninterpBuffer = []
+    // currentIdx is where the next point is going to be -- doesn't exist yet
   }
-  this.addPoint = ([x,y,width,normal]) => {
-    var pointAtIndex = idx => ([points.get(...[idx-1], 0), points.get(...[idx-1], 1)])
-    var l2Distance = (p1, p2) => Math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
-    var quadraticCurve = (p1, p2, p3) => {
-      console.log(p1, p2, p3)
-      var [x1, y1] = p1
-      var [x2, y2] = p2
-      var [x3, y3] = p3
-      var denom = (x1-x2) * (x1-x3) * (x2-x3)
-      var A = (x3 * (y2-y1) + x2 * (y1-y3) + x1 * (y3-y2)) / denom
-      var B = (x3**2 * (y1-y2) + x2**2 * (y3-y1) + x1**2 * (y2-y3)) / denom
-      var C = (x2 * x3 * (x2-x3) * y1 + x3 * x1 * (x3-x1) * y2 + x1 * x2 * (x1-x2) * y3) / denom
-      return [A, B, C]
-    }
+  var pointAtIndex = idx => ({x: points.get(...[idx], 0), y: points.get(...[idx], 1)})
+  this.addPoint = ({p ,width,normal}) => {
+    var l2Distance = (p1, p2) => Math.sqrt((p1.x-p2.x)**2 + (p1.y-p2.y)**2)
 
-    if (l2Distance([x,y], pointAtIndex(currentIdx)) > 10) {
-      var lastPoint = pointAtIndex(currentIdx)
-      // var [A, B, C] = quadraticCurve(pointAtIndex(currentIdx-1), lastPoint, [x,y])
-      // var newPointX = lastPoint[0] + (x - lastPoint[0])/2
-      // var newPointY = A * newPointX**2 + B * newPointX + C
-      // console.log(A, B, C)
-      // console.log(newPointX)
-      // console.log(newPointY)
-      // this.addPointToSet([newPointX,newPointY,width,normal])
-      this.addPointToSet([x,y,width,normal])
+    var numPointsInLine = currentLineNoninterpBuffer.length
+
+    var color = [0,0,0,255]
+    var randColor = () => [...[1,1,1].map(x => Math.floor(Math.random()*255)), 255]
+    var distanceFromLastPoint = l2Distance(p, pointAtIndex(currentIdx - 1))
+
+    if (distanceFromLastPoint <= 1) {
+      return
+    } else if (distanceFromLastPoint > 10 && numPointsInLine >= 3) {
+      var lastTwoPoints = [2,1].map(d => currentLineNoninterpBuffer[numPointsInLine - d])
+      var bezier = Bezier.quadraticFromPoints(...lastTwoPoints, p, 0.5)
+      var subCurve = bezier.split(0.5, 1)
+      var curveLength = bezier.length()
+      var curveLUT = subCurve.getLUT(Math.floor(curveLength / 10))
+      curveLUT.slice(1, curveLUT.length - 1).forEach(p => {
+        this.addPointToSet({p ,width, normal, color})
+        // this.addPointToSet({p ,width, normal, color: randColor()})
+      })
+      this.addPointToSet({p ,width,normal, color})
+
     } else {
-      this.addPointToSet([x,y,width,normal])
+      this.addPointToSet({p ,width,normal, color})
     }
 
+    currentLineNoninterpBuffer.push(p)
   }
 
-  this.addPointToSet = ([x, y, width, normal]) => {
-    var [lastX, lastY] = [points.get(...[currentIdx-1], 0), points.get(...[currentIdx-1], 1)]
-    normal = normal || [-(y - lastY), x - lastX]
+  this.addPointToSet = ({p, width, normal, color}) => {
+    var lastPoint = pointAtIndex(currentIdx - 1)
+    normal = normal || [-(p.y - lastPoint.y), p.x - lastPoint.x]
     normals.set(...[currentIdx, 0], normal[0])
     normals.set(...[currentIdx, 1], normal[1])
-    points.set(...[currentIdx, 0], x)
-    points.set(...[currentIdx, 1], y)
+
+    points.set(...[currentIdx, 0], p.x)
+    points.set(...[currentIdx, 1], p.y)
+
+    colors.set(...[currentIdx, 0], color[0])
+    colors.set(...[currentIdx, 1], color[1])
+    colors.set(...[currentIdx, 2], color[2])
+    colors.set(...[currentIdx, 3], color[3])
+
     widths.set(...[currentIdx], width)
     currentIdx += 1
   }
 
   var buffers = {}
-  var bufferSet1 = {"point": points, "width": widths, "normal": normals}
+  var bufferSet1 = {"point": points, "width": widths, "normal": normals, "color": colors}
   var bufferSet2 = {"normalMultiplier": null}
   Object.keys({...bufferSet1, ...bufferSet2}).forEach(name => {
     buffers[name] = this.regl.buffer()
@@ -117,6 +130,7 @@ function LinesState (regl) {
 
 var App = props => {
   var containerRef = React.useRef()
+  var [pos, setPos] = React.useState(0)
 
   React.useEffect(() => {
     var cleanupFunctions = []
@@ -135,10 +149,12 @@ var App = props => {
     // Canvas
     var canvas = document.createElement('canvas')
     canvas.style.cssText = "height: 100%; width: 100%"
+    // var ratio = window.devicePixelRatio
+    // canvas.style.cssText = `height: ${screen.width*ratio}px; width: ${screen.height*ratio}px`
     containerRef.current.appendChild(canvas)
     var regl = Regl({canvas})
     var resizeCanvas = () => {
-      const ratio = window.devicePixelRatio
+      const ratio = 1//window.devicePixelRatio
       const { height, width} = canvas.getBoundingClientRect();
       canvas.height = height * ratio
       canvas.width = width * ratio
@@ -162,28 +178,32 @@ var App = props => {
 
       var screenSpaceToCanvasSpace = ({pageX, pageY}) => {
         var canvasRect = canvas.getBoundingClientRect();
+        //TODO: initial-scale has to be 0.5 to get touch accuracy. But safari page size with
+        // that isn't correct. SO use other checks to get canvas to right size.
         var relX = pageX - canvasRect.left - window.pageXOffset
         var relY = pageY - canvasRect.top  - window.pageYOffset
-        return [relX, relY]
+        return {x: relX, y: relY}
       }
-      var [x, y] = screenSpaceToCanvasSpace(e)
+      var {x, y} = screenSpaceToCanvasSpace(e)
+      setPos(e && e.touches && e.touches[0].pageX)
 
+      // Handle when pencil / touch leaves canvas.
       var canvasSize = canvas.getBoundingClientRect();
-      if (x >= canvasSize.width || x < 0 || y >= canvasSize.height || y < 0) {pencilOnPaper = false}
+      if (x >= canvasSize.width || x < 0 || y >= canvasSize.height || y < 0) {
+        linesState.startNewLine()
+        return
+      }
+      ;["mouseleave"].forEach(name => addEventListener(canvas, name, e => linesState.startNewLine()))
 
       if (pencilOnPaper) {
-        // const minDist = 1
-        // var lastPoint = currentLine[currentLine.length - 1] || [-minDist, -minDist]
-        // if (Math.abs(lastPoint[0] - x) > minDist || Math.abs(lastPoint[1]-y) > minDist) {
         var width = 1
         var normal
         if (e.touches && e.touches[0]) {
           var touch = e.touches[0]
           // width = Math.cos(touch.altitudeAngle) * 10 + 2
-          normal = [10*Math.cos(touch.azimuthAngle), 10*Math.sin(touch.azimuthAngle)]
+          // normal = [10*Math.cos(touch.azimuthAngle), 10*Math.sin(touch.azimuthAngle)]
         }
-        linesState.addPoint([x, y, width, normal])
-        // }
+        linesState.addPoint({p: {x, y}, width, normal})
       }
     }
     ;["touchstart", "mousedown"].forEach(name => addEventListener(canvas, name, e => handleTouch("start", e)))
@@ -212,9 +232,11 @@ var App = props => {
         attribute float width;
         attribute float normalMultiplier;
         uniform mat4 projection;
+        attribute vec4 color;
+        varying vec4 colorOut;
         void main() {
+          colorOut = color;
           vec2 normedNormal = normalize(normal);
-
           vec2 pointPosition = width * normedNormal * normalMultiplier + point;
 
           gl_Position = projection * vec4(pointPosition, 0, 1);
@@ -222,14 +244,13 @@ var App = props => {
 
       frag: `
         precision mediump float;
-        uniform vec4 color;
+        varying vec4 colorOut;
         void main() {
-          gl_FragColor = color;
+          gl_FragColor = colorOut / 255.0;
         }`,
 
       uniforms: {
         projection: canvasSpaceToGlSpace,
-        color: () => ([0,0,0,1])
       },
 
       attributes: {
@@ -265,6 +286,10 @@ var App = props => {
   }, [])
 
   var html = <div style={{height: "100%", padding: "50px", boxSizing: "border-box"}}>
+    <div>
+      {window.innerWidth}
+      {"| |" + pos}
+    </div>
     <div ref={containerRef} style={{boxShadow: "0px 0px 3px #ccc",}}>
     </div>
   </div>
