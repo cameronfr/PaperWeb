@@ -64,7 +64,9 @@ function syncedBuffer({arrayType, bufferType, shape, doubleTheBuffer, useElement
 
 function LinesState ({regl, setStats}) {
   this.regl = regl
-  var arrayLength = 40000 // length in number of points. ipad glitches out if use 40,000? So mb can't just store all on GPU...
+  var arrayLength = 500000// length in number of points.
+  //TODO: both ipad and mac glitches out when get to 25,000 points when limit is 40,000 -- should be issue with element buffers being uint16, and uint16 max val is 65535
+
   var points = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
   var widths = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength], doubleTheBuffer: true, regl: this.regl})
   var normals = new syncedBuffer({arrayType: Int16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
@@ -154,7 +156,7 @@ function LinesState ({regl, setStats}) {
     bufferDict[bufferName] = bufferList[key].buffer
   })
 
-  var elements = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength*6], doubleTheBuffer: false, useElements: true, regl: this.regl})
+  var elements = new syncedBuffer({arrayType: Uint32Array, shape: [arrayLength*6], doubleTheBuffer: false, useElements: true, regl: this.regl})
   var updateElements = (pointIdx, isNewLineStart) => {
     if (pointIdx < 1 || isNewLineStart) {
       return
@@ -220,7 +222,7 @@ var App = props => {
     canvas.style.cssText = "height: 100%; width: 100%"
     // canvas.style.cssText = `height: ${screen.width*ratio}px; width: ${screen.height*ratio}px`
     containerRef.current.appendChild(canvas)
-    var regl = Regl({canvas})
+    var regl = Regl({canvas, extensions: ["OES_element_index_uint"]})
     var resizeCanvas = () => {
       const ratio = 1//window.devicePixelRatio
       const { height, width} = canvas.getBoundingClientRect();
