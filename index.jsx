@@ -18,9 +18,10 @@ function syncedBuffer({arrayType, bufferType, shape, doubleTheBuffer, useElement
 
   var typedArray = new arrayType(prod(shape))
   var reglType = useElements ? regl.elements : regl.buffer
+  var initialBufferValues = new arrayType(prod(shape) * (doubleTheBuffer ? 2 : 1))
+  // Was getting weird behavior when setting length:arr.length * arr.BYTES_PER_ELEMENT and type: manual type instead of data: arr
   var buffer = reglType({
-    type: bufferType,
-    length: typedArray.length * typedArray.BYTES_PER_ELEMENT * (doubleTheBuffer ? 2 : 1),
+    data: initialBufferValues,
     usage: "dynamic"
   })
 
@@ -63,15 +64,11 @@ function syncedBuffer({arrayType, bufferType, shape, doubleTheBuffer, useElement
 
 function LinesState ({regl, setStats}) {
   this.regl = regl
-  var arrayLength = 30000 // length in number of points. ipad glitches out if make this too high
-  // var points = ndarray(new Uint16Array(arrayLength*2), [arrayLength, 2])
-  // var widths = ndarray(new Uint16Array(arrayLength), [arrayLength])
-  // var normals = ndarray(new Int16Array(arrayLength*2), [arrayLength, 2])
-  // var colors = ndarray(new Uint8Array(arrayLength*4), [arrayLength, 4])
-  var points = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
-  var widths = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength], doubleTheBuffer: true, regl: this.regl})
-  var normals = new syncedBuffer({arrayType: Int16Array, bufferType: "int16", shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
-  var colors = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength, 4], doubleTheBuffer: true, regl: this.regl})
+  var arrayLength = 40000 // length in number of points. ipad glitches out if use 40,000? So mb can't just store all on GPU...
+  var points = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var widths = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength], doubleTheBuffer: true, regl: this.regl})
+  var normals = new syncedBuffer({arrayType: Int16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var colors = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength, 4], doubleTheBuffer: true, regl: this.regl})
   var lineBreaks = {}
   var lastLineBreak = 0
   var currentIdx = 0
@@ -134,10 +131,12 @@ function LinesState ({regl, setStats}) {
     }
 
     widths.set([currentIdx], width)
+    updateElements(currentIdx, currentIdx == lastLineBreak)
+
     currentIdx += 1
   }
 
-  var normalMultipliers = new syncedBuffer({arrayType: Int16Array, bufferType: "int16", shape: [arrayLength*2], doubleTheBuffer: false, regl: this.regl})
+  var normalMultipliers = new syncedBuffer({arrayType: Int16Array, shape: [arrayLength*2], doubleTheBuffer: false, regl: this.regl})
   for (var i = 0; i < arrayLength; i++) {
     normalMultipliers.set([i], 1)
   }
@@ -155,26 +154,41 @@ function LinesState ({regl, setStats}) {
     bufferDict[bufferName] = bufferList[key].buffer
   })
 
-  // TODO: update elements with each new point added
-  // var elements = syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [(numPoints - 1) * 2 * 3], doubleTheBuffer: false, useElements: true, regl: this.regl})
-  // var updateElements = () => {
-  // }
-
-  this.elements = () => {
-    var numPoints = currentIdx
-    var elements = []
-    if (numPoints < 2) {return ({elements})}
-    var elements = new Uint16Array((numPoints - 1) * 2 * 3)
-    for (var idx =0; idx<numPoints-1; idx++) {
-      if (idx+1 in lineBreaks) {continue}
-      var tri1 = [idx, idx+arrayLength + 1, idx+1]
-      elements.set(tri1, 6*idx)
-      var tri2 = [idx+arrayLength, idx+arrayLength+1, idx]
-      elements.set(tri2, 6*idx + 3)
+  var elements = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength*6], doubleTheBuffer: false, useElements: true, regl: this.regl})
+  var updateElements = (pointIdx, isNewLineStart) => {
+    if (pointIdx < 1 || isNewLineStart) {
+      return
     }
-    return {elements}
+    var tri1 = [pointIdx -1, pointIdx + arrayLength, pointIdx]
+    var tri2 = [pointIdx - 1 + arrayLength, pointIdx + arrayLength , pointIdx - 1]
+    var tris = [...tri1, ...tri2]
+    tris.forEach((vertexIdx, i) => {
+      elements.set([(pointIdx-1)*tris.length+i], tris[i])
+    })
   }
+  // this.elements = () => ({elements: elements})
+  this.elements = () => ({elements: elements.buffer})
+  // this.elements = () => ({elements: this.regl.elements({data: elements.typedArray})})
+  this.count = () => ({count: Math.max(0, currentIdx - 1) * 2 * 3})
 
+  // this.oldelements = () => {
+  //   var numPoints = currentIdx
+  //   var elements = []
+  //   if (numPoints < 2) {return ({elements})}
+  //   var elements = new Uint16Array((numPoints - 1) * 2 * 3)
+  //   for (var idx =0; idx<numPoints-1; idx++) {
+  //     if (idx+1 in lineBreaks) {continue}
+  //     var tri1 = [idx, idx+arrayLength + 1, idx+1]
+  //     elements.set(tri1, 6*idx)
+  //     var tri2 = [idx+arrayLength, idx+arrayLength+1, idx]
+  //     elements.set(tri2, 6*idx + 3)
+  //   }
+  //   elements = this.regl.elements({
+  //     data: elements,
+  //   })
+  //   return {elements}
+  // }
+  //
   this.attributes = () => {
     return bufferDict
   }
@@ -312,7 +326,7 @@ var App = props => {
       },
 
       elements: (context, props) => props.elements,
-
+      count: (context, props) => props.count,
       primitive: "triangles",
     })
     cleanupFunctions.push(regl.destroy)
@@ -327,6 +341,7 @@ var App = props => {
       var props = {
         ...linesState.attributes(),
         ...linesState.elements(),
+        ...linesState.count(),
       }
       drawLines(props)
       animationFrameRequestId = window.requestAnimationFrame(tick)
