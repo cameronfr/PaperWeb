@@ -11,13 +11,67 @@ var ndSlice = (ndarr, from, to) => {
   return ndarr.lo(...from).hi(...lengths)
 }
 
-function LinesState (regl) {
+function syncedBuffer({arrayType, bufferType, shape, doubleTheBuffer, useElements, regl}) {
+  // doubleTheBuffer: if the cpu typedArray is [1,2,3, ..., n], the buffer will be [1,2,3,...,n,1,2,3,...,n]
+
+  var prod = arr => arr.reduce((a, b) => a*b, 1)
+
+  var typedArray = new arrayType(prod(shape))
+  var reglType = useElements ? regl.elements : regl.buffer
+  var buffer = reglType({
+    type: bufferType,
+    length: typedArray.length * typedArray.BYTES_PER_ELEMENT * (doubleTheBuffer ? 2 : 1),
+    usage: "dynamic"
+  })
+
+  this.shape = shape
+  this.typedArray = typedArray
+  this.buffer = buffer
+
+  var offsets = shape.map((dimSize, dim) => {
+    var subDims = shape.slice(dim+1, shape.length)
+    var itemsInSubDims = prod(subDims)
+    return itemsInSubDims
+  })
+
+  var getLocationForIndexes = indexes => {
+    var location = 0
+    indexes.forEach((i, dim) => {
+      i >= shape[dim] && console.log(`Invalid index ${i} at dim ${dim}, shape is ${shape}`)
+      location += i * offsets[dim]
+    })
+    return location
+  }
+
+  this.set = (indexes, value) => {
+    var location = getLocationForIndexes(indexes)
+    typedArray[location] = value
+    buffer.subdata([value], (location) * typedArray.BYTES_PER_ELEMENT)
+    if (doubleTheBuffer) {
+      buffer.subdata([value], (location + typedArray.length) * typedArray.BYTES_PER_ELEMENT)
+    }
+  }
+
+  this.get = (indexes) => {
+    var location = getLocationForIndexes(indexes)
+    var value = typedArray[location]
+    return value
+  }
+
+}
+
+
+function LinesState ({regl, setStats}) {
   this.regl = regl
-  var arrayLength = 10000 // length in number of points
-  var points = ndarray(new Uint16Array(arrayLength*2), [arrayLength, 2])
-  var widths = ndarray(new Uint16Array(arrayLength), [arrayLength])
-  var normals = ndarray(new Int16Array(arrayLength*2), [arrayLength, 2])
-  var colors = ndarray(new Uint8Array(arrayLength*4), [arrayLength, 4])
+  var arrayLength = 30000 // length in number of points. ipad glitches out if make this too high
+  // var points = ndarray(new Uint16Array(arrayLength*2), [arrayLength, 2])
+  // var widths = ndarray(new Uint16Array(arrayLength), [arrayLength])
+  // var normals = ndarray(new Int16Array(arrayLength*2), [arrayLength, 2])
+  // var colors = ndarray(new Uint8Array(arrayLength*4), [arrayLength, 4])
+  var points = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var widths = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength], doubleTheBuffer: true, regl: this.regl})
+  var normals = new syncedBuffer({arrayType: Int16Array, bufferType: "int16", shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var colors = new syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [arrayLength, 4], doubleTheBuffer: true, regl: this.regl})
   var lineBreaks = {}
   var lastLineBreak = 0
   var currentIdx = 0
@@ -29,7 +83,7 @@ function LinesState (regl) {
     currentLineNoninterpBuffer = []
     // currentIdx is where the next point is going to be -- doesn't exist yet
   }
-  var pointAtIndex = idx => ({x: points.get(...[idx], 0), y: points.get(...[idx], 1)})
+  var pointAtIndex = idx => ({x: points.get([idx, 0]), y: points.get([idx, 1])})
   this.addPoint = ({p ,width,normal}) => {
     var l2Distance = (p1, p2) => Math.sqrt((p1.x-p2.x)**2 + (p1.y-p2.y)**2)
 
@@ -61,36 +115,50 @@ function LinesState (regl) {
   }
 
   this.addPointToSet = ({p, width, normal, color}) => {
+    setStats({numPoints: currentIdx})
     var lastPoint = pointAtIndex(currentIdx - 1)
     normal = normal || [-(p.y - lastPoint.y), p.x - lastPoint.x]
-    normals.set(...[currentIdx, 0], normal[0])
-    normals.set(...[currentIdx, 1], normal[1])
+    normals.set([currentIdx, 0], normal[0])
+    normals.set([currentIdx, 1], normal[1])
 
-    points.set(...[currentIdx, 0], p.x)
-    points.set(...[currentIdx, 1], p.y)
+    points.set([currentIdx, 0], p.x)
+    points.set([currentIdx, 1], p.y)
 
-    colors.set(...[currentIdx, 0], color[0])
-    colors.set(...[currentIdx, 1], color[1])
-    colors.set(...[currentIdx, 2], color[2])
-    colors.set(...[currentIdx, 3], color[3])
+    colors.set([currentIdx, 0], color[0])
+    colors.set([currentIdx, 1], color[1])
+    colors.set([currentIdx, 2], color[2])
+    colors.set([currentIdx, 3], color[3])
 
-    widths.set(...[currentIdx], width)
+    if (currentIdx == lastLineBreak) {
+      width = 0
+    }
+
+    widths.set([currentIdx], width)
     currentIdx += 1
   }
 
-  var buffers = {}
-  var bufferSet1 = {"point": points, "width": widths, "normal": normals, "color": colors}
-  var bufferSet2 = {"normalMultiplier": null}
-  Object.keys({...bufferSet1, ...bufferSet2}).forEach(name => {
-    buffers[name] = this.regl.buffer()
+  var normalMultipliers = new syncedBuffer({arrayType: Int16Array, bufferType: "int16", shape: [arrayLength*2], doubleTheBuffer: false, regl: this.regl})
+  for (var i = 0; i < arrayLength; i++) {
+    normalMultipliers.set([i], 1)
+  }
+  for (var i = arrayLength; i < arrayLength*2; i++) {
+    normalMultipliers.set([i], -1)
+  }
+
+  var bufferList = {points, widths, normals, colors, normalMultipliers}
+  var bufferDict = {}
+  Object.keys(bufferList).forEach(key => {
+    var bufferName = key
+    if (bufferName[bufferName.length - 1] == "s") {
+      bufferName = bufferName.slice(0, bufferName.length - 1)
+    }
+    bufferDict[bufferName] = bufferList[key].buffer
   })
 
-  var normalDirections = ndarray(new Int16Array(arrayLength * 2))
-  ndops.assigns(ndSlice(normalDirections, [0], [arrayLength]), 1)
-  ndops.assigns(ndSlice(normalDirections, [arrayLength], [arrayLength*2]), -1)
-  buffers["normalMultiplier"]({
-    data: Array.from(normalDirections.data), type: "int8"
-  })
+  // TODO: update elements with each new point added
+  // var elements = syncedBuffer({arrayType: Uint16Array, bufferType: "uint16", shape: [(numPoints - 1) * 2 * 3], doubleTheBuffer: false, useElements: true, regl: this.regl})
+  // var updateElements = () => {
+  // }
 
   this.elements = () => {
     var numPoints = currentIdx
@@ -108,21 +176,7 @@ function LinesState (regl) {
   }
 
   this.attributes = () => {
-    // updates the buffers
-    Object.keys(bufferSet1).forEach(name => {
-      //TODO: update buffers instead of creating new
-      var typedArray = bufferSet1[name].data
-      // need to double points for this line method. matches type of typedarray
-      var doubledTypedArray = new typedArray.constructor(typedArray.length * 2)
-      doubledTypedArray.set(typedArray, 0)
-      doubledTypedArray.set(typedArray, typedArray.length)
-      if (name == "normal") {
-      }
-      buffers[name]({
-        data: doubledTypedArray
-      })
-    })
-    return buffers
+    return bufferDict
   }
 
 
@@ -131,6 +185,7 @@ function LinesState (regl) {
 var App = props => {
   var containerRef = React.useRef()
   var [pos, setPos] = React.useState(0)
+  var [stats, setStats] = React.useState({})
 
   React.useEffect(() => {
     var cleanupFunctions = []
@@ -149,7 +204,6 @@ var App = props => {
     // Canvas
     var canvas = document.createElement('canvas')
     canvas.style.cssText = "height: 100%; width: 100%"
-    // var ratio = window.devicePixelRatio
     // canvas.style.cssText = `height: ${screen.width*ratio}px; width: ${screen.height*ratio}px`
     containerRef.current.appendChild(canvas)
     var regl = Regl({canvas})
@@ -164,7 +218,7 @@ var App = props => {
     addEventListener(window, "resize", resizeCanvas)
 
     // pencil & touch & click fallback
-    var linesState = new LinesState(regl)
+    var linesState = new LinesState({regl, setStats})
     var pencilOnPaper = false
     var currentLine = []
     var handleTouch = (type, e) => {
@@ -196,7 +250,7 @@ var App = props => {
       ;["mouseleave"].forEach(name => addEventListener(canvas, name, e => linesState.startNewLine()))
 
       if (pencilOnPaper) {
-        var width = 1
+        var width = 2
         var normal
         if (e.touches && e.touches[0]) {
           var touch = e.touches[0]
@@ -288,7 +342,7 @@ var App = props => {
   var html = <div style={{height: "100%", padding: "50px", boxSizing: "border-box"}}>
     <div>
       {window.innerWidth}
-      {"| |" + pos}
+      {"| |" + stats.numPoints}
     </div>
     <div ref={containerRef} style={{boxShadow: "0px 0px 3px #ccc",}}>
     </div>
