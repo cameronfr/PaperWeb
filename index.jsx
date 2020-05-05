@@ -5,6 +5,7 @@ import mat4 from "gl-mat4"
 import ndarray from "ndarray"
 import ndops from "ndarray-ops"
 import Bezier from "bezier-js"
+import Stats from "stats.js"
 
 var ndSlice = (ndarr, from, to) => {
   var lengths = to.map((t, idx) => from[idx] - t)
@@ -64,13 +65,13 @@ function syncedBuffer({arrayType, bufferType, shape, doubleTheBuffer, useElement
 
 function LinesState ({regl, setStats}) {
   this.regl = regl
-  var arrayLength = 500000// length in number of points.
+  var arrayLength = 100000// length in number of points.
   //TODO: both ipad and mac glitches out when get to 25,000 points when limit is 40,000 -- should be issue with element buffers being uint16, and uint16 max val is 65535
 
-  var points = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var points = new syncedBuffer({arrayType: Float32Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
   var widths = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength], doubleTheBuffer: true, regl: this.regl})
-  var normals = new syncedBuffer({arrayType: Int16Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
-  var colors = new syncedBuffer({arrayType: Uint16Array, shape: [arrayLength, 4], doubleTheBuffer: true, regl: this.regl})
+  var normals = new syncedBuffer({arrayType: Float32Array, shape: [arrayLength, 2], doubleTheBuffer: true, regl: this.regl})
+  var colors = new syncedBuffer({arrayType: Uint8Array, shape: [arrayLength, 4], doubleTheBuffer: true, regl: this.regl})
   var lineBreaks = {}
   var lastLineBreak = 0
   var currentIdx = 0
@@ -98,6 +99,7 @@ function LinesState ({regl, setStats}) {
       var lastTwoPoints = [2,1].map(d => currentLineNoninterpBuffer[numPointsInLine - d])
       var bezier = Bezier.quadraticFromPoints(...lastTwoPoints, p, 0.5)
       var subCurve = bezier.split(0.5, 1)
+      // this.addPointToSet({p:subCurve.get(0.5) ,width, normal, color: [255, 0, 0, 255]})
       var curveLength = bezier.length()
       var curveLUT = subCurve.getLUT(Math.floor(curveLength / 10))
       curveLUT.slice(1, curveLUT.length - 1).forEach(p => {
@@ -127,6 +129,7 @@ function LinesState ({regl, setStats}) {
     colors.set([currentIdx, 1], color[1])
     colors.set([currentIdx, 2], color[2])
     colors.set([currentIdx, 3], color[3])
+
 
     if (currentIdx == lastLineBreak) {
       width = 0
@@ -168,204 +171,237 @@ function LinesState ({regl, setStats}) {
       elements.set([(pointIdx-1)*tris.length+i], tris[i])
     })
   }
-  // this.elements = () => ({elements: elements})
+
   this.elements = () => ({elements: elements.buffer})
-  // this.elements = () => ({elements: this.regl.elements({data: elements.typedArray})})
   this.count = () => ({count: Math.max(0, currentIdx - 1) * 2 * 3})
 
-  // this.oldelements = () => {
-  //   var numPoints = currentIdx
-  //   var elements = []
-  //   if (numPoints < 2) {return ({elements})}
-  //   var elements = new Uint16Array((numPoints - 1) * 2 * 3)
-  //   for (var idx =0; idx<numPoints-1; idx++) {
-  //     if (idx+1 in lineBreaks) {continue}
-  //     var tri1 = [idx, idx+arrayLength + 1, idx+1]
-  //     elements.set(tri1, 6*idx)
-  //     var tri2 = [idx+arrayLength, idx+arrayLength+1, idx]
-  //     elements.set(tri2, 6*idx + 3)
-  //   }
-  //   elements = this.regl.elements({
-  //     data: elements,
-  //   })
-  //   return {elements}
-  // }
-  //
   this.attributes = () => {
     return bufferDict
   }
+}
 
+function CanvasManager({canvas, linesState, regl, onNewPoint}) {
+  this.onNewPoint = onNewPoint
 
+  var cleanupFunctions = []
+
+  // Listener apparatus
+  var listeners = []
+  var addEventListener = (obj, eventName, func) => {
+    listeners.push([obj, eventName, func])
+    obj.addEventListener(eventName, func)
+  }
+  var cleanupListeners = () => {
+    listeners.map(([obj, eventName, func]) => obj.removeEventListener(eventName, func))
+  }
+  cleanupFunctions.push(cleanupListeners)
+
+  // Canvas
+  var resizeCanvas = () => {
+    const ratio = 1//window.devicePixelRatio
+    const { height, width} = canvas.getBoundingClientRect();
+    canvas.height = height * ratio
+    canvas.width = width * ratio
+    regl.poll() //update viewport dims to canvas dims
+  }
+  resizeCanvas()
+  addEventListener(window, "resize", resizeCanvas)
+
+  // pencil & touch & click fallback
+  var handleTouch = (type, e) => {
+    e.preventDefault()
+
+    var screenSpaceToCanvasSpace = ({pageX, pageY}) => {
+      var canvasRect = canvas.getBoundingClientRect();
+      //TODO: initial-scale has to be 0.5 to get touch accuracy. But safari page size with
+      // that isn't correct. SO use other checks to get canvas to right size.
+      var relX = pageX - canvasRect.left - window.pageXOffset
+      var relY = pageY - canvasRect.top  - window.pageYOffset
+      return {x: relX, y: relY}
+    }
+    var {x, y} = screenSpaceToCanvasSpace(e)
+
+    // Handle when pencil / touch leaves canvas.
+    var canvasSize = canvas.getBoundingClientRect();
+    if (x >= canvasSize.width || x < 0 || y >= canvasSize.height || y < 0) {
+      linesState.startNewLine()
+      return
+    }
+    ;["mouseleave"].forEach(name => addEventListener(canvas, name, e => linesState.startNewLine()))
+
+    if (e.touches && e.touches[0]) {
+      var touch = e.touches[0]
+      var {azimuthAngle, altitudeAngle} = touch
+    }
+
+    this.onNewPoint({type, p: {x, y}, azimuthAngle, altitudeAngle})
+  }
+  ;["touchstart", "mousedown"].forEach(name => addEventListener(canvas, name, e => handleTouch("start", e)))
+  ;["touchmove", "mousemove"].forEach(name => addEventListener(canvas, name, e => handleTouch("move", e)))
+  ;["touchend", "mouseup"].forEach(name => addEventListener(canvas, name, e => handleTouch("end", e)))
+
+  // Projection matrix
+  var canvasRect = canvas.getBoundingClientRect();
+  var matrix = mat4.create()
+  // order needs to be reversed
+  mat4.scale(matrix, matrix, [2, -2, 1])
+  mat4.translate(matrix, matrix, [-0.5, -0.5, 0])
+  mat4.scale(matrix, matrix, [1/canvasRect.width, 1/canvasRect.height, 1])
+  var canvasSpaceToGlSpace = matrix
+
+  var attributeFunctions = {}
+  Object.keys(linesState.attributes()).forEach(name => {
+    attributeFunctions[name] = (context, props) => props[name]
+  })
+
+  const drawLines = regl({
+    vert: `
+      precision mediump float;
+      attribute vec2 point;
+      attribute vec2 normal;
+      attribute float width;
+      attribute float normalMultiplier;
+      uniform mat4 projection;
+      attribute vec4 color;
+      varying vec4 colorOut;
+      void main() {
+        colorOut = color;
+        vec2 normedNormal = normalize(normal);
+        vec2 pointPosition = width * normedNormal * normalMultiplier + point;
+
+        gl_Position = projection * vec4(pointPosition, 0, 1);
+      }`,
+
+    frag: `
+      precision mediump float;
+      varying vec4 colorOut;
+      void main() {
+        gl_FragColor = colorOut / 255.0;
+      }`,
+
+    uniforms: {
+      projection: canvasSpaceToGlSpace,
+    },
+
+    attributes: {
+      ...attributeFunctions
+    },
+
+    elements: (context, props) => props.elements,
+    count: (context, props) => props.count,
+    primitive: "triangles",
+  })
+
+  var stats = new Stats();
+  stats.showPanel(0);
+  canvas.parentNode.appendChild(stats.dom)
+
+  // Animation
+  var tick = () => {
+    stats.begin()
+    var time = Date.now()
+    regl.clear({
+      color: [0, 0, 0, 0],
+      depth: 1
+    })
+    var props = {
+      ...linesState.attributes(),
+      ...linesState.elements(),
+      ...linesState.count(),
+    }
+    drawLines(props)
+    animationFrameRequestId = window.requestAnimationFrame(tick)
+    stats.end()
+  }
+  var animationFrameRequestId = window.requestAnimationFrame(tick)
+  var stopAnimation = () => window.cancelAnimationFrame(animationFrameRequestID)
+  cleanupFunctions.push(stopAnimation)
+
+  this.cleanup = () => cleanupFunctions.forEach(f => f())
 }
 
 var App = props => {
   var containerRef = React.useRef()
-  var [pos, setPos] = React.useState(0)
   var [stats, setStats] = React.useState({})
 
+  var [linesState, setLinesState] = React.useState()
+  var [regl, setRegl] = React.useState()
+  var [canvasManager, setCanvasManager] = React.useState()
+
   React.useEffect(() => {
-    var cleanupFunctions = []
-
-    // Listener apparatus
-    var listeners = []
-    var addEventListener = (obj, eventName, func) => {
-      listeners.push([obj, eventName, func])
-      obj.addEventListener(eventName, func)
-    }
-    var cleanupListeners = () => {
-      listeners.map(([obj, eventName, func]) => obj.removeEventListener(eventName, func))
-    }
-    cleanupFunctions.push(cleanupListeners)
-
-    // Canvas
     var canvas = document.createElement('canvas')
     canvas.style.cssText = "height: 100%; width: 100%"
-    // canvas.style.cssText = `height: ${screen.width*ratio}px; width: ${screen.height*ratio}px`
     containerRef.current.appendChild(canvas)
-    var regl = Regl({canvas, extensions: ["OES_element_index_uint"]})
-    var resizeCanvas = () => {
-      const ratio = 1//window.devicePixelRatio
-      const { height, width} = canvas.getBoundingClientRect();
-      canvas.height = height * ratio
-      canvas.width = width * ratio
-      regl.poll() //update viewport dims to canvas dims
-    }
-    resizeCanvas()
-    addEventListener(window, "resize", resizeCanvas)
 
-    // pencil & touch & click fallback
+    var regl = Regl({canvas, extensions: ["OES_element_index_uint"]})
+    setRegl({regl})
     var linesState = new LinesState({regl, setStats})
+    setLinesState(linesState)
+    var canvasManager = new CanvasManager({linesState, regl, canvas, onNewPoint: () => null})
+    setCanvasManager(canvasManager)
+  }, [])
+
+  React.useEffect(() => {
     var pencilOnPaper = false
-    var currentLine = []
-    var handleTouch = (type, e) => {
+    var onNewPoint = ({type, p, altitudeAngle, azimuthAngle}) => {
       if (type == "start") {
         pencilOnPaper = true
         linesState.startNewLine()
       }
       if (type == "end") {pencilOnPaper = false}
 
-      e.preventDefault()
-
-      var screenSpaceToCanvasSpace = ({pageX, pageY}) => {
-        var canvasRect = canvas.getBoundingClientRect();
-        //TODO: initial-scale has to be 0.5 to get touch accuracy. But safari page size with
-        // that isn't correct. SO use other checks to get canvas to right size.
-        var relX = pageX - canvasRect.left - window.pageXOffset
-        var relY = pageY - canvasRect.top  - window.pageYOffset
-        return {x: relX, y: relY}
-      }
-      var {x, y} = screenSpaceToCanvasSpace(e)
-      setPos(e && e.touches && e.touches[0].pageX)
-
-      // Handle when pencil / touch leaves canvas.
-      var canvasSize = canvas.getBoundingClientRect();
-      if (x >= canvasSize.width || x < 0 || y >= canvasSize.height || y < 0) {
-        linesState.startNewLine()
-        return
-      }
-      ;["mouseleave"].forEach(name => addEventListener(canvas, name, e => linesState.startNewLine()))
-
       if (pencilOnPaper) {
         var width = 2
         var normal
-        if (e.touches && e.touches[0]) {
-          var touch = e.touches[0]
+        if (altitudeAngle && azimuthAngle) {
           // width = Math.cos(touch.altitudeAngle) * 10 + 2
           // normal = [10*Math.cos(touch.azimuthAngle), 10*Math.sin(touch.azimuthAngle)]
         }
-        linesState.addPoint({p: {x, y}, width, normal})
+        linesState.addPoint({p, width, normal})
       }
     }
-    ;["touchstart", "mousedown"].forEach(name => addEventListener(canvas, name, e => handleTouch("start", e)))
-    ;["touchmove", "mousemove"].forEach(name => addEventListener(canvas, name, e => handleTouch("move", e)))
-    ;["touchend", "mouseup"].forEach(name => addEventListener(canvas, name, e => handleTouch("end", e)))
-
-    // Projection matrix
-    var canvasRect = canvas.getBoundingClientRect();
-    var matrix = mat4.create()
-    // order needs to be reversed
-    mat4.scale(matrix, matrix, [2, -2, 1])
-    mat4.translate(matrix, matrix, [-0.5, -0.5, 0])
-    mat4.scale(matrix, matrix, [1/canvasRect.width, 1/canvasRect.height, 1])
-    var canvasSpaceToGlSpace = matrix
-
-    var attributeFunctions = {}
-    Object.keys(linesState.attributes()).forEach(name => {
-      attributeFunctions[name] = (context, props) => props[name]
-    })
-
-    const drawLines = regl({
-      vert: `
-        precision mediump float;
-        attribute vec2 point;
-        attribute vec2 normal;
-        attribute float width;
-        attribute float normalMultiplier;
-        uniform mat4 projection;
-        attribute vec4 color;
-        varying vec4 colorOut;
-        void main() {
-          colorOut = color;
-          vec2 normedNormal = normalize(normal);
-          vec2 pointPosition = width * normedNormal * normalMultiplier + point;
-
-          gl_Position = projection * vec4(pointPosition, 0, 1);
-        }`,
-
-      frag: `
-        precision mediump float;
-        varying vec4 colorOut;
-        void main() {
-          gl_FragColor = colorOut / 255.0;
-        }`,
-
-      uniforms: {
-        projection: canvasSpaceToGlSpace,
-      },
-
-      attributes: {
-        ...attributeFunctions
-      },
-
-      elements: (context, props) => props.elements,
-      count: (context, props) => props.count,
-      primitive: "triangles",
-    })
-    cleanupFunctions.push(regl.destroy)
-
-    // Animation
-    var tick = () => {
-      var time = Date.now()
-      regl.clear({
-        color: [0, 0, 0, 0],
-        depth: 1
-      })
-      var props = {
-        ...linesState.attributes(),
-        ...linesState.elements(),
-        ...linesState.count(),
-      }
-      drawLines(props)
-      animationFrameRequestId = window.requestAnimationFrame(tick)
+    if(canvasManager) {
+      canvasManager.onNewPoint = onNewPoint
     }
-    var animationFrameRequestId = window.requestAnimationFrame(tick)
-    var stopAnimation = () => window.cancelAnimationFrame(animationFrameRequestID)
-    cleanupFunctions.push(stopAnimation)
+  }, [canvasManager, linesState])
 
-    var cleanup = () => cleanupFunctions.forEach(f => f())
-    return cleanup
-  }, [])
-
-  var html = <div style={{height: "100%", padding: "50px", boxSizing: "border-box"}}>
-    <div>
-      {window.innerWidth}
-      {"| |" + stats.numPoints}
+  // if render this component at 60fps, get noticeable slowdown
+  var html = <>
+    <div style={{height: "100%", padding: "50px", boxSizing: "border-box"}}>
+      <div>
+        {window.innerWidth}
+        {"| |" + Math.floor(stats.numPoints / 100) }
+      </div>
+      <div ref={containerRef} style={{boxShadow: "0px 0px 3px #ccc",}}>
+      </div>
     </div>
-    <div ref={containerRef} style={{boxShadow: "0px 0px 3px #ccc",}}>
-    </div>
-  </div>
+  </>
 
   return html
+}
+
+var ControlPanel = props => {
+  var colors = ["#000000", "#ff0000", "#00ff00"]
+  var [currentColor, setCurrentColor] = React.useState(colors[0])
+
+  colorList = colors.map(color => {
+    return <>
+      <div style={{backgroundColor: color, width: "20px", height: "20px", borderRadius: "5px"}}>
+
+      </div>
+    </>
+  })
+
+  var html = <>
+    <div style={{display: "grid", gridTemplateColumns: "auto", padding: "10px", boxShadow: "0px 0px 3px #ccc"}}>
+      colorList
+    </div>
+  </>
+
+}
+
+function hexToRGB(h) {
+  return [+("0x"+h[1]+h[2]), +("0x"+h[3]+h[4]), +("0x"+h[5]+h[6])]
 }
 
 ReactDOM.render((
